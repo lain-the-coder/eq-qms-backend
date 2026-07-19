@@ -5,9 +5,10 @@ that are not recorded in any guardrail document, and open flags. Nothing else �
 guardrail docs carry the substance and are always attached.
 
 - **Repo:** `github.com/lain-the-coder/ea-qms-backend`
-- **Last checkpoint:** 4 — `004_audit_logs.sql`
-- **Next task:** checkpoint 5 — `005_esignatures.sql` (not started)
-- **Schema version:** 4 · tables: `users`, `change_controls`, `file_attachments`, `audit_logs`
+- **Last checkpoint:** 5 — `005_esignatures.sql`
+- **Next task:** checkpoint 6 — `006_refresh_tokens.sql` (not started) — **the last table**
+- **Schema version:** 5 · tables: `users`, `change_controls`, `file_attachments`,
+  `audit_logs`, `esignatures`
 
 ---
 
@@ -65,18 +66,18 @@ too — dropping the sequence first fails, because the column default depends on
 First table with an FK into another migration's table; dropping it leaves
 `change_controls` untouched.
 
-| Check (DB §3.3 / §4.1 / §5.1 #10 / §5.3 / §6.1 / §6.2)                                 | Result |
-| -------------------------------------------------------------------------------------- | ------ |
-| 9 columns, §3.3 order and names                                                        | ✅     |
-| `BYTEA` for `file_data`, `BIGINT` for `file_size`                                      | ✅     |
-| **All 9 NOT NULL** — inverse of `change_controls`; a file row exists only after upload | ✅     |
-| 2 defaults — `gen_random_uuid()`, `NOW()`                                              | ✅     |
-| `ck_file_attachments_field_name` — `{supporting_documents, implementation_evidence}`   | ✅     |
-| `change_control_id` → `change_controls(id)` **ON DELETE CASCADE** (§4.1 #6)            | ✅     |
-| `uploaded_by_id` → `users(id)` **ON DELETE RESTRICT** (§4.1 #7)                        | ✅     |
-| `uq_file_attachments_cc_field` as a **UNIQUE CONSTRAINT** (§5.2 #3)                    | ✅     |
-| **Zero `CREATE INDEX` statements** (§5.3)                                              | ✅     |
-| No `file_size` CHECK — the 10 MB limit and MIME rules stay in the Go handler (§3.3)    | ✅     |
+| Check (DB §3.3 / §4.1 / §5.1 #10 / §5.3 / §6.1 / §6.2)                               | Result |
+| ------------------------------------------------------------------------------------ | ------ |
+| 9 columns, §3.3 order and names                                                      | ✅     |
+| `BYTEA` for `file_data`, `BIGINT` for `file_size`                                    | ✅     |
+| **All 9 NOT NULL** — a file row exists only after upload                             | ✅     |
+| 2 defaults — `gen_random_uuid()`, `NOW()`                                            | ✅     |
+| `ck_file_attachments_field_name` — `{supporting_documents, implementation_evidence}` | ✅     |
+| `change_control_id` → `change_controls(id)` **ON DELETE CASCADE** (§4.1 #6)          | ✅     |
+| `uploaded_by_id` → `users(id)` **ON DELETE RESTRICT** (§4.1 #7)                      | ✅     |
+| `uq_file_attachments_cc_field` as a **UNIQUE CONSTRAINT** (§5.2 #3)                  | ✅     |
+| **Zero `CREATE INDEX` statements** (§5.3)                                            | ✅     |
+| No `file_size` CHECK — the 10 MB limit and MIME rules stay in the Go handler (§3.3)  | ✅     |
 
 **Lesson:** why no separate index on `change_control_id` — the composite
 `(change_control_id, field_name)` sorts by the first column, so leftmost-prefix already
@@ -98,46 +99,70 @@ serves "all files for this CC". A second index would cost writes for nothing.
 | `fk_audit_logs_performed_by_id` → `users(id)` RESTRICT — the only FK                     | ✅     |
 | `performed_by_name` a plain NOT NULL snapshot column, not a join                         | ✅     |
 | 3 indexes: `idx_audit_entity`, `idx_audit_created_on` (DESC), `idx_audit_performed_by`   | ✅     |
-| No UNIQUE constraint                                                                     | ✅     |
-| **No triggers or rules attempting immutability** (§8.3 — the application's job)          | ✅     |
+| No UNIQUE constraint; no triggers attempting immutability (§8.3)                         | ✅     |
 
 **Lesson:** `entity_id` looks exactly like a foreign key and must not be one. It points at
 either `change_controls` or `users` depending on `entity_type` — a single column can't FK
-two tables — and audit rows must outlive whatever they describe. CASCADE would erase
-history; RESTRICT would block legitimate cleanup.
+two tables — and audit rows must outlive whatever they describe.
+
+### ✅ Checkpoint 5 — esignatures migration
+
+**`sql/schema/005_esignatures.sql`** — applied, up → `\d` → down → `\dt` → up clean.
+
+| Check (DB §3.5 / §4.1 #9–10 / §4.3 / §5.1 #14 / §6.1 / §6.2)                                                     | Result |
+| ---------------------------------------------------------------------------------------------------------------- | ------ |
+| 7 columns, all NOT NULL                                                                                          | ✅     |
+| **No `updated_on`, no soft-delete column** — immutability is the design (§3.5)                                   | ✅     |
+| 2 defaults — `gen_random_uuid()`, `NOW()`                                                                        | ✅     |
+| `signer_name` a snapshot column, not a join (BR-8.8.5)                                                           | ✅     |
+| `ck_esignatures_transition` — T2–T8; **T1 is never signed**                                                      | ✅     |
+| `ck_esignatures_meaning` — 7 values; **ASCII hyphens on the four gate meanings, verified in the catalog** (§6.5) | ✅     |
+| `change_control_id` → `change_controls(id)` **RESTRICT** (§4.3)                                                  | ✅     |
+| `signer_id` → `users(id)` RESTRICT                                                                               | ✅     |
+| `idx_esignatures_cc` on `(change_control_id)`                                                                    | ✅     |
+| **No UNIQUE constraint** — rejection loops legitimately produce multiple rows per gate                           | ✅     |
+
+**Lesson:** the mirror image of checkpoint 3. `change_control_id` **CASCADEs** in
+`file_attachments` and **RESTRICTs** here — same column name, same target table, opposite
+rule. A file has no meaning without its CC; a signature is a permanent regulatory artifact
+and blocking the delete is the correct outcome.
 
 ---
 
 ## Next
 
-### ⬜ Checkpoint 5 — `005_esignatures.sql`
+### ⬜ Checkpoint 6 — `006_refresh_tokens.sql` — the last table
 
-Sources: DB Design **§3.5** (7 columns) · **§3.5 note "the two-table separation"** ·
-**§4.1** · **§5.1** · **§6.1** · **§6.2**.
+Sources: DB Design **§3.6** (6 columns) · **§4.1 row 11** and **§4.3** · **§5.1 #15** ·
+**§6.2**. Auth infrastructure from Blueprint §7, not a BRD entity.
 
-- 7 columns, **all NOT NULL**: `id`, `change_control_id`, `signer_id`, `signer_name`,
-  `transition`, `meaning`, `signed_on`
-- `signer_name` is a snapshot, same rationale as `audit_logs.performed_by_name` (BR-8.8.5)
-- Two CHECKs: `ck_esignatures_transition` — `{'T2'..'T8'}`, **T1 never signs**; and
-  `ck_esignatures_meaning` — the seven-value closed set, **ASCII hyphens** in the four
-  gate meanings
-- **No `updated_on`, no soft-delete column** — immutability is the point (§3.5)
-- Rows accumulate and are never updated or deleted (BR-8.8.7). A CC through a rejection
-  loop holds multiple rows for the same gate. `change_controls` holds only the _latest_
-  decision; `esignatures` holds _all_. **Do not deduplicate**
-- A successful signature writes to **both** `audit_logs` (`SignatureCaptured`) and
-  `esignatures`, in one transaction. Failed attempts go to `audit_logs` only (BR-8.8.8)
+- **6 columns:** `token`, `user_id`, `created_on`, `updated_on`, `expires_at`, `revoked_at`
+- **The PK is `token TEXT` — there is no `id UUID` column.** Every other table in the
+  schema uses a UUID surrogate key; this one doesn't. Don't add one out of habit
+- `revoked_at` is the **only nullable column**; the other five are NOT NULL
+- 2 defaults — `created_on` and `updated_on` both `NOW()`. **No `gen_random_uuid()`**,
+  since there's no UUID column
+- **Zero CHECK constraints** on this table
+- `fk_refresh_tokens_user_id` → `users(id)` **ON DELETE CASCADE** (§4.1 #11, §4.3) — a
+  token is meaningless without its user. Second CASCADE in the schema
+- One index: `idx_refresh_tokens_user` on `(user_id)` — revoke-all / lookup by user
+- **`updated_on`, not `updated_at`** — see flag #3. It drives the 30-minute sliding
+  inactivity window: touched on every successful refresh, and a refresh where
+  `NOW() - updated_on > 30 min` is rejected. `expires_at` is the absolute cap;
+  `revoked_at` is set on logout
+- Plain `DROP TABLE` Down
 
-### ⬜ Remaining
+### ⬜ Then — seed
 
-`006_refresh_tokens` (see flag #3 — `updated_on`, not `updated_at`) · seed (4 users, one
-per role, hashed with the app's own argon2id — never pasted hashes, gated on
-`PLATFORM=dev`, §7; **no CC, file, audit, esignature or token rows**, §7.3)
+4 users, one per role, hashed with the app's own argon2id — **never pasted hashes** —
+gated on `PLATFORM=dev` (§7). **No CC, file, audit, esignature or token rows** (§7.3):
+seeding a CC would mean hand-fabricating a valid state + status + audit history. Create
+one through the API instead.
 
-### ⬜ Then
+### ⬜ Then — the API
 
 sqlc setup (`emit_pointers_for_null_types: true`) → build in API Endpoint Plan order,
-starting `POST /api/login`.
+starting `POST /api/login` → `middlewareAuth` → `GET /api/me`.
 
 ---
 
@@ -145,32 +170,32 @@ starting `POST /api/login`.
 
 Settled in working sessions and binding. They exist nowhere else.
 
-| #   | Decision                                                                                                                                                                                                             | Rationale                                                                                                                                                                                                                                                                                            |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | **Module path `github.com/lain-the-coder/ea-qms-backend`** — not `-cc-backend`                                                                                                                                       | Future QMS modules (Deviation, CAPA) live under the same module rather than forcing a second repo                                                                                                                                                                                                    |
-| 2   | **Constraint/index naming follows §5.1 and §6.1 verbatim, including their abbreviations** — `ck_cc_*`, `idx_cc_*`, `idx_audit_*` (short) while CHECKs stay full (`ck_audit_logs_*`) — _not_ §1.3's long-form example | §5.1/§6.1 are definitions and are cross-referenced by name elsewhere (§8.2 cites `idx_cc_owner_state`); §1.3 is a convention statement with one stale example. Also keeps names clear of Postgres's 63-byte identifier truncation                                                                    |
-| 3   | **Two naming exceptions kept verbatim:** `uq_change_controls_cc_id` and `ck_cc_post_impl_issues`                                                                                                                     | Spelled that way in §3.2/§5.1 and §6.1 respectively — do not "regularize" them                                                                                                                                                                                                                       |
-| 4   | **FK constraints use the long form** — `fk_<table>_<column>`, e.g. `fk_audit_logs_performed_by_id`                                                                                                                   | §4 lists all eleven FKs but never names the constraints, so §1.3 stands unopposed for this object type. Decision #2 does not extend to FKs. The name is what appears in the Postgres error text you map to a 409 (Blueprint §11)                                                                     |
-| 5   | **PostgreSQL 14.23 accepted** (doc §1.2 specifies 15+)                                                                                                                                                               | Every needed feature traced and predates 14: `gen_random_uuid()` core (13), `GENERATED ALWAYS AS ... STORED` (12), `ON CONFLICT DO UPDATE` (9.5), `SELECT ... FOR UPDATE`, functional/composite indexes                                                                                              |
-| 6   | **`log.Fatal(server.ListenAndServe())`**, not a bare call                                                                                                                                                            | A discarded error means a bind failure exits silently with status 0 and no message                                                                                                                                                                                                                   |
-| 7   | **Goose run as a global CLI from `sql/schema`**                                                                                                                                                                      | Matches prior boot.dev workflow; keeps migration files free of Go wiring                                                                                                                                                                                                                             |
-| 8   | **Uniqueness form rule:** plain columns → table `CONSTRAINT ... UNIQUE`; expressions or partials → `CREATE UNIQUE INDEX`                                                                                             | A `UNIQUE` table constraint accepts only a column list, so `uq_users_email` on `LOWER(email)` _must_ be an index. Constraints are preferred otherwise: they support `ON CONFLICT ON CONSTRAINT <name>`, appear in `information_schema.table_constraints`, and are what Postgres's own docs recommend |
-| 9   | **DBeaver is connected for browsing only.** All schema changes go through goose; no UI edits, no UI-created rows                                                                                                     | Applied migrations are the schema's only description (Blueprint §13). DBeaver also splits `\d` across tabs and blurs the constraint-vs-index distinction from decision #8 — so **DBeaver to navigate, psql to verify**                                                                               |
+| #   | Decision                                                                                                                                                                                                                                 | Rationale                                                                                                                                                                                                                                                                                            |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | **Module path `github.com/lain-the-coder/ea-qms-backend`** — not `-cc-backend`                                                                                                                                                           | Future QMS modules (Deviation, CAPA) live under the same module rather than forcing a second repo                                                                                                                                                                                                    |
+| 2   | **Constraint/index naming follows §5.1 and §6.1 verbatim, including their abbreviations** — `ck_cc_*`, `idx_cc_*`, `idx_audit_*` (short) while CHECKs stay full (`ck_audit_logs_*`, `ck_esignatures_*`) — _not_ §1.3's long-form example | §5.1/§6.1 are definitions and are cross-referenced by name elsewhere (§8.2 cites `idx_cc_owner_state`); §1.3 is a convention statement with one stale example. Also keeps names clear of Postgres's 63-byte identifier truncation                                                                    |
+| 3   | **Two naming exceptions kept verbatim:** `uq_change_controls_cc_id` and `ck_cc_post_impl_issues`                                                                                                                                         | Spelled that way in §3.2/§5.1 and §6.1 respectively — do not "regularize" them                                                                                                                                                                                                                       |
+| 4   | **FK constraints use the long form** — `fk_<table>_<column>`, e.g. `fk_esignatures_signer_id`                                                                                                                                            | §4 lists all eleven FKs but never names the constraints, so §1.3 stands unopposed for this object type. Decision #2 does not extend to FKs. The name is what appears in the Postgres error text you map to a 409 (Blueprint §11)                                                                     |
+| 5   | **PostgreSQL 14.23 accepted** (doc §1.2 specifies 15+)                                                                                                                                                                                   | Every needed feature traced and predates 14: `gen_random_uuid()` core (13), `GENERATED ALWAYS AS ... STORED` (12), `ON CONFLICT DO UPDATE` (9.5), `SELECT ... FOR UPDATE`, functional/composite indexes                                                                                              |
+| 6   | **`log.Fatal(server.ListenAndServe())`**, not a bare call                                                                                                                                                                                | A discarded error means a bind failure exits silently with status 0 and no message                                                                                                                                                                                                                   |
+| 7   | **Goose run as a global CLI from `sql/schema`**                                                                                                                                                                                          | Matches prior boot.dev workflow; keeps migration files free of Go wiring                                                                                                                                                                                                                             |
+| 8   | **Uniqueness form rule:** plain columns → table `CONSTRAINT ... UNIQUE`; expressions or partials → `CREATE UNIQUE INDEX`                                                                                                                 | A `UNIQUE` table constraint accepts only a column list, so `uq_users_email` on `LOWER(email)` _must_ be an index. Constraints are preferred otherwise: they support `ON CONFLICT ON CONSTRAINT <name>`, appear in `information_schema.table_constraints`, and are what Postgres's own docs recommend |
+| 9   | **DBeaver is connected for browsing only.** All schema changes go through goose; no UI edits, no UI-created rows                                                                                                                         | Applied migrations are the schema's only description (Blueprint §13). DBeaver also splits `\d` across tabs and blurs the constraint-vs-index distinction from decision #8 — so **DBeaver to navigate, psql to verify**                                                                               |
 
 ---
 
 ## Open flags
 
-| #   | Flag                                                                                                                                                                                                                                                                                                                                                                 | Status                                                                    |
-| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| 1   | **`change_controls` column count contradiction.** §3.2 and the §3 Summary state **48 columns**, but §3.2's own parenthetical reads "id + cc_number + 48 of the 50 BRD fields" = **50**                                                                                                                                                                               | **Resolved: built 50, confirmed in the database.** Doc correction pending |
-| 2   | **`change_controls` DEFAULT count.** §6.4 says 8; §6.2 enumerates 7. The likely 8th is `cc_id`, which §6.2 explicitly states has _no_ DEFAULT                                                                                                                                                                                                                        | **Resolved: 7, confirmed in the database.** Doc correction pending        |
-| 3   | **`updated_at` vs `updated_on` on `refresh_tokens`.** Blueprint §7's code sample uses `updated_at`; DB Design §3.6 and CONTEXT_HANDOFF both say `updated_on`. Per precedence the DB doc wins — the Blueprint snippet is stale. Affects migration 006 and the refresh handler                                                                                         | Logged, resolution clear                                                  |
-| 4   | **En-dash in HTML prototype `<option value="...">`.** A frontend built from the prototypes verbatim fails `ck_cc_requires_testing` on every submit — that constraint is now live. Frontend must normalize at the API boundary, or the prototypes get fixed. The same ASCII-hyphen risk applies to the four gate meanings in `ck_esignatures_meaning` (migration 005) | Open risk, pre-existing (DB §6.5)                                         |
-| 5   | **BRD §13.1 deferral note** for the three descoped password flows                                                                                                                                                                                                                                                                                                    | Lain to add on next BRD touch                                             |
-| 6   | **Production version parity.** Dev is on PostgreSQL 14.23; if production runs 15/16 there's a major-version gap. No feature dependency — belongs in deployment notes                                                                                                                                                                                                 | Noted                                                                     |
-| 7   | **The two `.docx` guardrail files are stored as plain text** despite the extension. Read them directly; do not attempt to unzip                                                                                                                                                                                                                                      | Environmental note                                                        |
-| 8   | **CC-ID gaps are expected and permanent.** `nextval()` is non-transactional, so a rolled-back or failed insert burns a number forever. Not a defect — the cost of collision-free IDs under concurrency — but QA will ask                                                                                                                                             | Behaviour note; may warrant a line in user documentation                  |
+| #   | Flag                                                                                                                                                                                                                                                                                                                                    | Status                                                                    |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| 1   | **`change_controls` column count contradiction.** §3.2 and the §3 Summary state **48 columns**, but §3.2's own parenthetical reads "id + cc_number + 48 of the 50 BRD fields" = **50**                                                                                                                                                  | **Resolved: built 50, confirmed in the database.** Doc correction pending |
+| 2   | **`change_controls` DEFAULT count.** §6.4 says 8; §6.2 enumerates 7. The likely 8th is `cc_id`, which §6.2 explicitly states has _no_ DEFAULT                                                                                                                                                                                           | **Resolved: 7, confirmed in the database.** Doc correction pending        |
+| 3   | **`updated_at` vs `updated_on` on `refresh_tokens`.** Blueprint §7's code sample uses `updated_at`; DB Design §3.6 and CONTEXT_HANDOFF both say `updated_on`. Per precedence the DB doc wins — the Blueprint snippet is stale. **Affects checkpoint 6 (next) and the refresh handler**                                                  | Logged, resolution clear                                                  |
+| 4   | **En-dash in HTML prototype `<option value="...">`.** A frontend built from the prototypes verbatim fails `ck_cc_requires_testing` on every submit. Frontend must normalize at the API boundary, or the prototypes get fixed. The parallel risk in `ck_esignatures_meaning` is now closed — those four values are ASCII in the database | Open for `change_controls`; closed for `esignatures` (DB §6.5)            |
+| 5   | **BRD §13.1 deferral note** for the three descoped password flows                                                                                                                                                                                                                                                                       | Lain to add on next BRD touch                                             |
+| 6   | **Production version parity.** Dev is on PostgreSQL 14.23; if production runs 15/16 there's a major-version gap. No feature dependency — belongs in deployment notes                                                                                                                                                                    | Noted                                                                     |
+| 7   | **The two `.docx` guardrail files are stored as plain text** despite the extension. Read them directly; do not attempt to unzip                                                                                                                                                                                                         | Environmental note                                                        |
+| 8   | **CC-ID gaps are expected and permanent.** `nextval()` is non-transactional, so a rolled-back or failed insert burns a number forever. Not a defect — the cost of collision-free IDs under concurrency — but QA will ask                                                                                                                | Behaviour note; may warrant a line in user documentation                  |
 
 ---
 
@@ -187,7 +212,7 @@ goose postgres "postgres://postgres:PASS@localhost:5432/ea_qms?sslmode=disable" 
 
 # dry-run a migration before handing it to goose — psql reports the exact line
 # and a caret; goose only reports that something failed
-psql "postgres://postgres:PASS@localhost:5432/ea_qms?sslmode=disable" -f 005_esignatures.sql
+psql "postgres://postgres:PASS@localhost:5432/ea_qms?sslmode=disable" -f 006_refresh_tokens.sql
 
 # psql
 psql "postgres://postgres:PASS@localhost:5432/ea_qms?sslmode=disable"
@@ -219,3 +244,5 @@ a bug: find it now, locally (Blueprint §13).
 - **Sequences are non-transactional.** `nextval()` does not roll back — see flag #8.
 - Once a statement errors inside a transaction, psql aborts the block: everything after
   returns _"current transaction is aborted"_ until `ROLLBACK`. Normal, not a stuck session.
+- **Checking for invisible characters:** en-dash vs hyphen can't be eyeballed. Scan the
+  file for any codepoint above 127 before running it — every value in this schema is ASCII.
