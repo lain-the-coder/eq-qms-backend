@@ -1,0 +1,49 @@
+version: "2"
+sql:
+  - schema: "sql/schema"
+    queries: "sql/queries"
+    engine: "postgresql"
+    gen:
+      go:
+        out: "internal/database"
+        package: "database"
+        emit_pointers_for_null_types: true
+        overrides:
+          # Nullable TEXT -> *string
+          - db_type: "text"
+            nullable: true
+            go_type:
+              type: "string"
+              pointer: true
+
+          # Nullable TIMESTAMPTZ -> *time.Time
+          - db_type: "timestamptz"
+            nullable: true
+            go_type:
+              import: "time"
+              type: "Time"
+              pointer: true
+
+          # Nullable DATE -> *time.Time
+          - db_type: "date"
+            nullable: true
+            go_type:
+              import: "time"
+              type: "Time"
+              pointer: true
+
+          # Nullable TIME -> *time.Time
+          - db_type: "pg_catalog.time"
+            nullable: true
+            go_type:
+              import: "time"
+              type: "Time"
+              pointer: true
+
+          # Nullable UUID -> *uuid.UUID
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              import: "github.com/google/uuid"
+              type: "UUID"
+              pointer: true
