@@ -5,8 +5,8 @@ that are not recorded in any guardrail document, and open flags. Nothing else �
 guardrail docs carry the substance and are always attached.
 
 - **Repo:** `github.com/lain-the-coder/ea-qms-backend`
-- **Last checkpoint:** 8b — structured logging (slog + context) · **all plumbing complete**
-- **Next task:** checkpoint 9 — `POST /api/login` (first real endpoint)
+- **Last checkpoint:** 9 — `POST /api/login` · **1 of 22 endpoints done**
+- **Next task:** checkpoint 10 — `middlewareAuth` + `GET /api/me`
 - **Schema version:** 6 · all six tables built and verified
 - **Review loop:** paste code in chat for review _before_ committing — review precedes
   commit, never follows it. (The repo is public and can be cloned if ever useful to look
@@ -16,14 +16,14 @@ guardrail docs carry the substance and are always attached.
 
 ## Phase status
 
-| Phase                             | State                                             |
-| --------------------------------- | ------------------------------------------------- |
-| Migrations (001–006)              | ✅ Complete — all six tables applied and verified |
-| sqlc setup                        | ✅ Complete — pointer types working under lib/pq  |
-| `internal/auth` (argon2id)        | ✅ Complete — hashing + tests + app wiring        |
-| `cmd/seed`                        | ✅ Complete — 4 users seeded and verified         |
-| Structured logging (slog+context) | ✅ Complete — request IDs proven end to end       |
-| API implementation (22 endpoints) | ⬜ **Next** — starting `POST /api/login`          |
+| Phase                             | State                                              |
+| --------------------------------- | -------------------------------------------------- |
+| Migrations (001–006)              | ✅ Complete — all six tables applied and verified  |
+| sqlc setup                        | ✅ Complete — pointer types working under lib/pq   |
+| `internal/auth` (argon2id)        | ✅ Complete — hashing + tests + app wiring         |
+| `cmd/seed`                        | ✅ Complete — 4 users seeded and verified          |
+| Structured logging (slog+context) | ✅ Complete — request IDs proven end to end        |
+| API implementation (22 endpoints) | 🔵 **In progress — 1 / 22** (`POST /api/login` ✅) |
 
 ---
 
@@ -282,22 +282,88 @@ handlers with `mux.HandleFunc`.
 
 ---
 
+### ✅ Checkpoint 9 — `POST /api/login` (endpoint 1 of 22)
+
+First real endpoint. Registration is **variation 1** (public — logging only, bare handler
+wrapped in `http.HandlerFunc`). `WelcomeHome` retired.
+
+**`internal/auth/jwt.go`**
+
+- `MakeJWT(userID, secret, expiresIn)` — HS256, `jwt.RegisteredClaims` only, issuer
+  `ea-qms` via a shared `const issuer`, one `time.Now().UTC()` anchor for both `iat`/`exp`.
+- **No role in the token, deliberately.** `middlewareAuth` loads the user from the DB on
+  every request anyway (it must, for `is_active`), so the role is always fresh. Baking it
+  into a 30-minute token would mean a BR-8.4.11 role change silently doesn't take effect
+  for up to half an hour.
+- `ValidateJWT` — `ParseWithClaims` with a keyfunc that **validates the signing method is
+  HMAC** (rejects `alg` confusion / `none` attacks) and `jwt.WithIssuer(issuer)`. Expiry is
+  checked by the library during parse. Returns `uuid.Nil` + wrapped error on failure.
+
+**`internal/auth/tokens.go`** — `MakeRefreshToken()`: 32 bytes from `crypto/rand`, hex.
+**Returns an error rather than `log.Fatal`** — a library function must never kill the
+process; that decision belongs to the caller.
+
+**`internal/auth/jwt_test.go`** — round trip, wrong secret rejected, expired rejected,
+malformed rejected. All pass.
+
+**`sql/queries/refresh_tokens.sql`** — `CreateRefreshToken :one` (token, user_id,
+expires_at; the rest from schema defaults).
+
+**`handlers_auth.go`** — decode → blank checks → `GetUserByEmail` → `CheckPasswordHash` →
+`is_active` → `MakeJWT` → `MakeRefreshToken` → `CreateRefreshToken` → respond.
+
+| Check                                                                                | Verified |
+| ------------------------------------------------------------------------------------ | -------- |
+| Six-field response (id, full_name, email, role, token, refresh_token)                | ✅       |
+| `ADMIN@EAQMS.LOCAL` logs in — `LOWER(email)` query + functional index                | ✅       |
+| Wrong password and unknown user return **byte-identical** 401s                       | ✅       |
+| JWT payload: `exp − iat = 1800` (30 min exactly)                                     | ✅       |
+| `refresh_tokens` rows with `expires_at` 24 h out, `revoked_at` NULL                  | ✅       |
+| Logs: shared `request_id`, WARN + real `reason`, generic client message, no password | ✅       |
+| All four seeded accounts log in; `owner@` returns role `CC Owner` (space intact)     | ✅       |
+| Timing equalised: unknown email 209 ms vs wrong password 229 ms (was 5 ms vs 137 ms) | ✅       |
+
+**Key ordering decision — password checked _before_ `is_active`.** The reverse would tell an
+attacker "Account is deactivated" for a _wrong_ password, revealing the account exists.
+Checking the password first means bad credentials always get the same generic 401, and
+"deactivated" is only disclosed to someone who already proved they hold valid credentials.
+
+**Timing side-channel closed.** The not-found path originally skipped argon2id entirely, so
+valid emails were enumerable by response time alone (5 ms vs 137 ms — a 27× gap, measured).
+Fix: `apiConfig.dummyHash` is generated **once at startup** with the real argon2id params,
+and the not-found branch runs `CheckPasswordHash` against it (`_, _ =` — the result is
+discarded, only the elapsed cost matters). Both branches now cost ~210–230 ms.
+
+**Other decisions:** token lifetime is server-controlled (`accessTokenTTL = 30m` const) —
+the Chirpy pattern of a client-supplied `expires_in_seconds` is an attacker-controlled
+lifetime and was dropped. `refreshTokenTTL = 24h` is the **absolute** cap (see decision #13).
+**No audit row** — `ck_audit_logs_action_type` has no login action; login isn't audited in
+Phase 1.
+
+**Logging convention established** (reused by every handler from here): short **stable
+`msg`** (`"login failed"`) + a **`reason`** field for the variant + identifying fields
+(`email`, `user_id`) + `error` only on system faults. `Warn` = user error, `Error` = system
+fault. This makes `msg="login failed"` find every failure while `reason=` narrows it.
+
+---
+
 ## Next
 
-### ⬜ Checkpoint 9 — `POST /api/login` (first real endpoint)
+### ⬜ Checkpoint 10 — `middlewareAuth` + `GET /api/me` (endpoints 4)
 
-The first genuine feature, logging in as one of the four seeded accounts. Per the API
-Endpoint Plan (endpoint 1) and Blueprint §6–§7: decode `{email, password}` → `GetUserByEmail`
-(case-insensitive, already built) → reject if `!is_active` → `auth.CheckPasswordHash` →
-issue a JWT access token (30 min) + a refresh token row. Needs the JWT half of
-`internal/auth` (`MakeJWT`) written for the first time. First handler to use the
-`log := logging.LoggerFrom(r.Context())` thread in anger.
+The auth spine. `internal/auth`: `GetBearerToken(r.Header)`. New query: `GetUserByID`.
+Then `middlewareAuth` per Blueprint §7 — the `authedHandler` three-parameter type, four
+gates (bearer → validate JWT → load user → `is_active`), calling `next(w, r, user)`.
+**This is where registration variation 2 appears** and where the explicit-user-argument
+pattern (decision #12) becomes real: a three-param handler cannot be registered without
+passing through `middlewareAuth`, so forgetting auth is a compile error.
 
-**Then, in API Endpoint Plan order:** `middlewareAuth` (variation 2/3 registration; the
-`authedHandler` explicit-user pattern) → `GET /api/me` → refresh/revoke (sliding window) →
-user management (incl. the `FOR UPDATE` transaction) → CC create/get/list/save-draft →
-**T2 submit, the first full transition, written inline** → T3, T4/5 (extract only then) →
-files → T6 → T7/8 → dashboard → signatures.
+`GET /api/me` is then trivial — return the user already handed to the handler.
+
+**Then, in API Endpoint Plan order:** refresh/revoke (sliding window) → user management
+(incl. the `FOR UPDATE` transaction) → CC create/get/list/save-draft → **T2 submit, the
+first full transition, written inline** → T3, T4/5 (extract only then) → files → T6 →
+T7/8 → dashboard → signatures.
 
 ---
 
@@ -319,22 +385,25 @@ Settled in working sessions and binding. They exist nowhere else.
 | 10  | **Nullable columns are forced to Go pointers via explicit sqlc `db_type` overrides, keeping `lib/pq`**                                                                                      | **Resolves a real contradiction between Blueprint §2 and §4.** sqlc's `emit_pointers_for_null_types` is _silently ignored_ unless `sql_package` is `pgx/v4` or `pgx/v5` — so §2 (lib/pq, deliberate) and §4 (pointers) cannot both hold as written. Rejected: switching to pgx (abandons §2's reasoning and changes the `BeginTx`/`WithTx` shape) and accepting `sql.NullXxx` (pays every cost §4 argued against — garbage JSON, a ×40 mapping loop, hand-rolled three-state draft logic). Five overrides give both. **The `db_type` spellings are not uniform and were found empirically: `text`, `timestamptz`, `date`, `uuid` bare; `time` requires `pg_catalog.time`.** Also: omit the `package` key when the import path already ends in the package name, or sqlc emits duplicate imports and the build fails                      |
 | 11  | **Password hashing uses `github.com/alexedwards/argon2id`, not raw `golang.org/x/crypto/argon2`**                                                                                           | Blueprint §2 names the algorithm (argon2id), not a package, so the choice was open. The library already does PHC-string encoding, `crypto/rand` salting, parameter round-tripping and constant-time comparison — a reviewed implementation rather than hand-rolled crypto plumbing. Params are set **explicitly** (not `DefaultParams` in app code) so a library-default change can't silently alter hashing strength, and so the values are auditable                                                                                                                                                                                                                                                                                                                                                                                   |
 | 12  | **Data delivered to handlers by two different mechanisms, chosen by failure mode: request logger via `context`, authenticated user via explicit argument**                                  | Fills the Blueprint §15 logging gap. The rule: _match the delivery mechanism to what happens when the thing is missing._ A missing logger is harmless → `context` value with a `slog.Default()` fallback (`LoggerFrom`). A missing authenticated user is a security hole → explicit third argument on an `authedHandler` type, so forgetting auth is a **compile error**, not a runtime surprise — the compiler becomes an auth control, which matters for a regulated system. Not inconsistency: same principle, opposite stakes. (Considered and rejected: context for both, for surface consistency — it would trade a compile-time guarantee for a per-route discipline across 22 routes.) Logging is minimal per §0/§15: request ID + start/finish + errors; runtime level-filtering deferred (slog provides the levels regardless) |
+| 13  | **Refresh token absolute expiry = 24 hours** (`refreshTokenTTL`); access token = 30 minutes (`accessTokenTTL`)                                                                              | The 30-min _sliding_ window on `updated_on` is specified by the guardrails; the **absolute** cap is not, so it was chosen here. Two clocks cover two threats: the sliding window logs out a walked-away session, but it cannot stop an _active_ attacker — a stolen token refreshed every 29 minutes would live forever, because the window measures inactivity. `expires_at` is stamped once at login and never moves, so a leaked token dies within 24 h regardless. 24 h covers any shift pattern while bounding exposure to a single day. Rejected: Chirpy's 60 days (far too long for a regulated system)                                                                                                                                                                                                                           |
 
 ---
 
 ## Open flags
 
-| #   | Flag                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Status                                                                                                             |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| 1   | **`change_controls` column count contradiction.** §3.2 and the §3 Summary state 48; §3.2's own parenthetical sums to 50                                                                                                                                                                                                                                                                                                                                                                                                                         | **Resolved: built 50, confirmed in the database.** Doc correction pending                                          |
-| 2   | **`change_controls` DEFAULT count.** §6.4 says 8; §6.2 enumerates 7 (`cc_id` uses a generation expression, not a DEFAULT)                                                                                                                                                                                                                                                                                                                                                                                                                       | **Resolved: 7, confirmed in the database.** Doc correction pending                                                 |
-| 3   | **`updated_at` vs `updated_on` on `refresh_tokens`.** Blueprint §7's code sample uses `updated_at`; DB Design §3.6 says `updated_on`                                                                                                                                                                                                                                                                                                                                                                                                            | **Resolved in the schema: `updated_on`.** The Blueprint snippet is stale — adjust when writing the refresh handler |
-| 4   | **En-dash in HTML prototype `<option value="...">`.** A frontend built from the prototypes verbatim fails `ck_cc_requires_testing` on every submit. Frontend must normalize at the API boundary, or the prototypes get fixed                                                                                                                                                                                                                                                                                                                    | Open for `change_controls`; closed for `esignatures` (DB §6.5)                                                     |
-| 5   | **BRD §13.1 deferral note** for the three descoped password flows                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | Lain to add on next BRD touch                                                                                      |
-| 6   | **Production version parity.** Dev is on PostgreSQL 14.23; if production runs 15/16 there's a major-version gap. No feature dependency — belongs in deployment notes                                                                                                                                                                                                                                                                                                                                                                            | Noted                                                                                                              |
-| 7   | **The two `.docx` guardrail files are stored as plain text** despite the extension. Read them directly; do not unzip                                                                                                                                                                                                                                                                                                                                                                                                                            | Environmental note                                                                                                 |
-| 8   | **CC-ID gaps are expected and permanent.** `nextval()` is non-transactional, so a rolled-back or failed insert burns a number forever. Not a defect — the cost of collision-free IDs under concurrency — but QA will ask                                                                                                                                                                                                                                                                                                                        | Behaviour note; may warrant a line in user documentation                                                           |
-| 9   | **`TIME` columns scanning into `*time.Time` is unverified at runtime.** `database/sql`'s `convertAssign` handles pointer-to-pointer natively, so `*string` and `*time.Time` are safe for `text`/`timestamptz`/`date` with lib/pq. But bare `TIME` (`implementation_window_start` / `_end`) may arrive from lib/pq as `[]byte` rather than `time.Time`, which would fail conversion. **First exposed when reading a CC with window times (≈ endpoint 12).** If it fails, the fix is a `column:` override to `string` plus parsing in the handler | Unverified — test at first read                                                                                    |
+| #   | Flag                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Status                                                                                                             |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| 1   | **`change_controls` column count contradiction.** §3.2 and the §3 Summary state 48; §3.2's own parenthetical sums to 50                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | **Resolved: built 50, confirmed in the database.** Doc correction pending                                          |
+| 2   | **`change_controls` DEFAULT count.** §6.4 says 8; §6.2 enumerates 7 (`cc_id` uses a generation expression, not a DEFAULT)                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | **Resolved: 7, confirmed in the database.** Doc correction pending                                                 |
+| 3   | **`updated_at` vs `updated_on` on `refresh_tokens`.** Blueprint §7's code sample uses `updated_at`; DB Design §3.6 says `updated_on`                                                                                                                                                                                                                                                                                                                                                                                                                                                             | **Resolved in the schema: `updated_on`.** The Blueprint snippet is stale — adjust when writing the refresh handler |
+| 4   | **En-dash in HTML prototype `<option value="...">`.** A frontend built from the prototypes verbatim fails `ck_cc_requires_testing` on every submit. Frontend must normalize at the API boundary, or the prototypes get fixed                                                                                                                                                                                                                                                                                                                                                                     | Open for `change_controls`; closed for `esignatures` (DB §6.5)                                                     |
+| 5   | **BRD §13.1 deferral note** for the three descoped password flows                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | Lain to add on next BRD touch                                                                                      |
+| 6   | **Production version parity.** Dev is on PostgreSQL 14.23; if production runs 15/16 there's a major-version gap. No feature dependency — belongs in deployment notes                                                                                                                                                                                                                                                                                                                                                                                                                             | Noted                                                                                                              |
+| 7   | **The two `.docx` guardrail files are stored as plain text** despite the extension. Read them directly; do not unzip                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Environmental note                                                                                                 |
+| 8   | **CC-ID gaps are expected and permanent.** `nextval()` is non-transactional, so a rolled-back or failed insert burns a number forever. Not a defect — the cost of collision-free IDs under concurrency — but QA will ask                                                                                                                                                                                                                                                                                                                                                                         | Behaviour note; may warrant a line in user documentation                                                           |
+| 9   | **`TIME` columns scanning into `*time.Time` is unverified at runtime.** `database/sql`'s `convertAssign` handles pointer-to-pointer natively, so `*string` and `*time.Time` are safe for `text`/`timestamptz`/`date` with lib/pq. But bare `TIME` (`implementation_window_start` / `_end`) may arrive from lib/pq as `[]byte` rather than `time.Time`, which would fail conversion. **First exposed when reading a CC with window times (≈ endpoint 12).** If it fails, the fix is a `column:` override to `string` plus parsing in the handler                                                  | Unverified — test at first read                                                                                    |
+| 10  | **Log rotation not implemented.** `logs/app.log` is append-only and grows unbounded. Fine for dev; production needs size/date-based rotation (e.g. lumberjack or logrotate) to avoid filling disk. Operational hardening, deliberately deferred (§0/§15 spirit — build the debugging value now, defer the ops hardening)                                                                                                                                                                                                                                                                         | Deferred; belongs in deployment notes                                                                              |
+| 11  | **Login timing side-channel (measured, not theoretical).** Observed response times: unknown email **5 ms**, wrong password **137 ms**, success **267 ms**. The not-found path skips the argon2id comparison entirely, so valid emails are enumerable by timing alone — no message difference needed. Mitigation is ~5 lines: run `CheckPasswordHash` against a throwaway dummy hash on the not-found path so both branches cost the same. Fixed in checkpoint 9: a dummy hash generated once at startup is verified on the not-found path, equalising the cost. Measured after: 209 ms vs 229 ms | **Closed**                                                                                                         |
 
 ---
 
