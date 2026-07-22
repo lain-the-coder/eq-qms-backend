@@ -2,57 +2,26 @@ package main
 
 import (
 	"database/sql"
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/alexedwards/argon2id"
 	"github.com/joho/godotenv"
+	"github.com/lain-the-coder/ea-qms-backend/internal/auth"
 	"github.com/lain-the-coder/ea-qms-backend/internal/database"
 	"github.com/lain-the-coder/ea-qms-backend/internal/logging"
 	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
-	db       *database.Queries
-	platform string
-	secret   string
-	params   *argon2id.Params
-	rawDB    *sql.DB
-	logger   *slog.Logger
-}
-
-func (cfg *apiConfig) WelcomeHome(w http.ResponseWriter, r *http.Request) {
-	type WelcomeRequest struct {
-		Message string `json:"message"`
-	}
-	type WelcomeResponse struct {
-		Company string `json:"company"`
-		Message string `json:"message"`
-	}
-	log := logging.LoggerFrom(r.Context())
-	reqBody := WelcomeRequest{}
-	err := json.NewDecoder(r.Body).Decode(&reqBody)
-	if err != nil {
-		log.Error("failed to decode request body", "error", err)
-		// delegating error structuring to helper function
-		respondWithError(w, "Something went wrong", http.StatusInternalServerError)
-		return
-	}
-	reqBody.Message = strings.TrimSpace(reqBody.Message)
-	if reqBody.Message == "" {
-		log.Warn("message field was blank")
-		respondWithError(w, "Message cannot be blank", http.StatusBadRequest)
-		return
-	}
-	log.Info("welcome home hit", "company", "EA QMS")
-	resBody := WelcomeResponse{
-		Company: "EA QMS",
-		Message: "Welcome! I hope you enjoy this system!",
-	}
-	respondWithJSON(w, http.StatusOK, resBody)
+	db        *database.Queries
+	platform  string
+	secret    string
+	params    *argon2id.Params
+	rawDB     *sql.DB
+	logger    *slog.Logger
+	dummyHash string
 }
 
 func main() {
@@ -79,6 +48,13 @@ func main() {
 	platform := os.Getenv("PLATFORM")
 	secret := os.Getenv("JWT_SECRET")
 	argonParams := loadArgon2idParams()
+	// A throwaway hash used only to equalise login timing on the
+	// user-not-found path, so valid emails aren't enumerable by response time.
+	dummyHash, err := auth.HashPassword("timing-equalisation-placeholder", argonParams)
+	if err != nil {
+		logger.Error("failed to generate dummy hash", "error", err)
+		os.Exit(1)
+	}
 
 	// db setup
 	rawDB, err := sql.Open("postgres", dbURL)
@@ -94,17 +70,19 @@ func main() {
 
 	db := database.New(rawDB)
 
+	// shared configuration struct
 	cfg := &apiConfig{
-		db:       db,
-		platform: platform,
-		secret:   secret,
-		params:   argonParams,
-		rawDB:    rawDB,
-		logger:   logger,
+		db:        db,
+		platform:  platform,
+		secret:    secret,
+		params:    argonParams,
+		rawDB:     rawDB,
+		logger:    logger,
+		dummyHash: dummyHash,
 	}
 
 	// routes
-	mux.Handle("POST /", cfg.middlewareLogging(http.HandlerFunc(cfg.WelcomeHome)))
+	mux.Handle("POST /api/login", cfg.middlewareLogging(http.HandlerFunc(cfg.HandlerLogin)))
 	server := &http.Server{
 		Addr:    ":1304",
 		Handler: mux,
